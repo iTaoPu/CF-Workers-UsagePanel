@@ -54,7 +54,7 @@ export default {
                     }
 
                     return UsagePanel管理面板(管理员TOKEN);
-                }
+                } else return new Response(null, { status: 302, headers: { 'Location': '/' } });
 
             } else if (区分大小写访问路径.startsWith('api/') && request.method === 'POST') {// API接口
                 if (区分大小写访问路径 === 'api/login') { // 管理员登录接口
@@ -85,12 +85,7 @@ export default {
                     }
                 }
 
-                if (!验证管理员Cookie()) {
-                    return new Response(null, {
-                        status: 302,
-                        headers: { 'Location': '/' }
-                    });
-                }
+                if (!验证管理员Cookie()) return new Response(null, { status: 302, headers: { 'Location': '/' } });
 
                 if (区分大小写访问路径 === 'api/logout') {// 登出接口
                     return new Response(JSON.stringify({ success: true, msg: '登出成功' }), {
@@ -404,6 +399,9 @@ function 掩码敏感信息(文本, 前缀长度 = 3, 后缀长度 = 2) {
 ////////////////////////////////HTML页面//////////////////////////////////
 
 async function UsagePanel管理面板(TOKEN) {
+    const userIDMD5 = await MD5MD5(TOKEN);
+    const UUID = [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
+    const 专属ID标识 = 'ed' + userIDMD5.slice(0, 8);
     const html = `
 <!DOCTYPE html>
 <html lang="zh-CN">
