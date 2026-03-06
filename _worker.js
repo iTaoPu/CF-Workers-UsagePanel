@@ -1,5 +1,3 @@
-
-
 export default {
     async fetch(request, env, ctx) {
         const 面板管理员账号 = env.USER || env.user || env.USERNAME || env.username || 'admin';
@@ -352,8 +350,11 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
             AccountID = d.result[idx >= 0 ? idx : 0]?.id;
         }
 
+        // 修复点：统计当月1日至今的请求量
         const now = new Date();
-        now.setUTCHours(0, 0, 0, 0);
+        now.setUTCDate(1);              // 当月1日
+        now.setUTCHours(0, 0, 0, 0);    // 当天0点
+
         const hdr = APIToken ? { ...cfg, "Authorization": `Bearer ${APIToken}` } : { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey };
 
         const res = await fetch(`${API}/graphql`, {
@@ -956,7 +957,7 @@ async function UsagePanel管理面板(TOKEN) {
 
     <div class="container">
         <div class="glass-card">
-            <h1>Workers/Pages 请求使用情况</h1>
+            <h1>Cloudflare 请求量情况</h1>
             <div id="summary-content">
                 <div class="loading-wrap"><div class="loading-spinner"></div></div>
             </div>
@@ -973,7 +974,7 @@ async function UsagePanel管理面板(TOKEN) {
         </div>
 
         <div class="footer">
-            由 <a href="https://github.com/cmliu/CF-Workers-UsagePanel" target="_blank" rel="noopener" class="footer">CF-Workers-UsagePanel</a> 强力驱动
+            © 2022-<script>document.write(new Date().getFullYear())</script> 蜂巢·隱曜
         </div>
     </div>
 
@@ -1113,16 +1114,6 @@ async function UsagePanel管理面板(TOKEN) {
             if (bar && percent > 0) {
                 const bgSize = (100 / percent) * 100;
                 bar.style.setProperty('--bg-size', \`\${bgSize}%\`);
-            }
-        }
-
-        async function logout() {
-            try {
-                await fetch('./api/logout', { method: 'POST' });
-            } catch (err) {
-                console.error('登出请求失败:', err);
-            } finally {
-                window.location.href = '/';
             }
         }
 
@@ -1335,7 +1326,7 @@ async function UsagePanel主页(TOKEN) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cloudflare Workers/Pages 请求数使用统计</title>
+    <title>Cloudflare 请求量统计</title>
     <link rel="icon" href="https://cf-assets.www.cloudflare.com/dzlvafdwdttg/5uhbWfhjepEoUiM9phzhgJ/9658369030266cde9e35a3c5d4e4beb2/cloud-upload.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -2285,7 +2276,7 @@ async function UsagePanel主页(TOKEN) {
     <div class="container">
         <div class="glass-card">
             <header>
-                <h1>☁️ Workers/Pages 请求数统计</h1>
+                <h1>☁️ Cloudflare 请求量统计</h1>
                 <div class="status-badge">
                     <div class="status-dot"></div>
                     <span>System Online</span>
@@ -2300,7 +2291,7 @@ async function UsagePanel主页(TOKEN) {
             </div>
 
             <div class="footer">
-                由 <a href="https://github.com/cmliu/CF-Workers-UsagePanel" target="_blank" rel="noopener" class="footer">CF-Workers-UsagePanel</a> 强力驱动
+                © 2022-<script>document.write(new Date().getFullYear())</script> 蜂巢·隱曜
             </div>
         </div>
     </div>
