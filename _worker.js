@@ -30,7 +30,8 @@ export default {
                     const 当前时间 = Date.now();
                     usage_json = await env.KV.get('usage.json', { type: 'json' }) || usage_json;
                     usage_json.success = true;
-                    usage_json.total = (usage_json.pages || 0) + (usage_json.workers || 0);
+                    usage_json.dayTotal = (usage_json.dayPages || 0) + (usage_json.dayWorkers || 0);
+                    usage_json.monthTotal = (usage_json.monthPages || 0) + (usage_json.monthWorkers || 0);
                     usage_json.msg = '✅ 成功加载请求数使用数据';
                     if (!usage_json.UpdateTime || (当前时间 - usage_json.UpdateTime) > 20 * 60 * 1000) usage_json = await 更新请求数(env);
                 }
@@ -120,14 +121,20 @@ export default {
                             UpdateTime: Date.now(),
                             Usage: {
                                 success: false,
-                                pages: 0,
-                                workers: 0,
-                                total: 0,
+                                // 新增字段：当日数据
+                                dayPages: 0,
+                                dayWorkers: 0,
+                                dayTotal: 0,
+                                // 新增字段：当月数据
+                                monthPages: 0,
+                                monthWorkers: 0,
+                                monthTotal: 0,
+                                // 原有字段：每日上限 10 万
                                 max: 100000
                             }
                         };
 
-                        // 验证 API 信息是否有效
+                        // 验证 API 信息是否有效，并获取当日和当月用量
                         const usage_result = await getCloudflareUsage(CF_JSON.Email, CF_JSON.GlobalAPIKey, CF_JSON.AccountID, CF_JSON.APIToken);
                         if (!usage_result.success) {
                             return new Response(JSON.stringify({ success: false, msg: '无法验证该CF账号的API信息' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
@@ -240,14 +247,25 @@ export default {
 
 ////////////////////////////////功能函数//////////////////////////////////
 const usage_json_default = {
-    success: false, // 是否成功获取使用情况
-    pages: 0, // cf的已使用的pages请求数
-    workers: 0, // cf的已使用的workers请求数
-    total: 0, // cf的已使用的总请求数
-    max: 0, // cf的请求数上限
-    UpdateTime: Date.now(), // 数据最后更新时间的时间戳
-    msg: '❌ 无效TOKEN' // 备注信息
-}
+    success: false,
+    // 原有字段
+    pages: 0,
+    workers: 0,
+    total: 0,
+    max: 0,
+    // 新增字段：当日数据
+    dayPages: 0,
+    dayWorkers: 0,
+    dayTotal: 0,
+    // 新增字段：当月数据
+    monthPages: 0,
+    monthWorkers: 0,
+    monthTotal: 0,
+    // 新增字段：当月总上限（所有账号当月上限之和）
+    monthMax: 0,
+    UpdateTime: Date.now(),
+    msg: '❌ 无效TOKEN'
+};
 
 async function 更新请求数(env) {
     let usage_config_json = await env.KV.get('usage_config.json', { type: 'json' });
@@ -261,17 +279,21 @@ async function 更新请求数(env) {
         usage_json.msg = '⚠️ 尚未添加任何Cloudflare账号';
         await env.KV.put('usage.json', JSON.stringify(usage_json));
     } else if (Array.isArray(usage_config_json) && usage_config_json.length > 0) {
-        // 如果存在则遍历配置文件中的每个账号，获取使用情况
-        // 累加所有账号的使用数据
+        // 累加所有账号的数据
         let total_pages = 0;
         let total_workers = 0;
+        let total_dayPages = 0;
+        let total_dayWorkers = 0;
+        let total_monthPages = 0;
+        let total_monthWorkers = 0;
         let total_max = 0;
+        let total_monthMax = 0; // 所有账号当月上限之和（每个账号 300 万）
 
         // 使用 Promise.all 并发获取所有账号的使用情况
         const updatePromises = usage_config_json.map(async (account) => {
             const { Email, GlobalAPIKey, AccountID, APIToken } = account;
 
-            // 获取该账号的使用情况
+            // 获取该账号的使用情况（包含当日和当月）
             const usage = await getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken);
 
             // 更新到该账号的 Usage 中
@@ -287,9 +309,16 @@ async function 更新请求数(env) {
         // 累加使用数据
         for (const usage of results) {
             if (usage.success) {
+                // 原有字段
                 total_pages += usage.pages || 0;
                 total_workers += usage.workers || 0;
+                // 新增字段
+                total_dayPages += usage.dayPages || 0;
+                total_dayWorkers += usage.dayWorkers || 0;
+                total_monthPages += usage.monthPages || 0;
+                total_monthWorkers += usage.monthWorkers || 0;
                 total_max += usage.max || 100000;
+                total_monthMax += 3000000; // 每个账号当月上限 300 万
             }
         }
 
@@ -301,7 +330,14 @@ async function 更新请求数(env) {
         usage_json.pages = total_pages;
         usage_json.workers = total_workers;
         usage_json.total = total_pages + total_workers;
+        usage_json.dayPages = total_dayPages;
+        usage_json.dayWorkers = total_dayWorkers;
+        usage_json.dayTotal = total_dayPages + total_dayWorkers;
+        usage_json.monthPages = total_monthPages;
+        usage_json.monthWorkers = total_monthWorkers;
+        usage_json.monthTotal = total_monthPages + total_monthWorkers;
         usage_json.max = total_max;
+        usage_json.monthMax = total_monthMax;
         usage_json.UpdateTime = Date.now();
         usage_json.msg = '✅ 成功更新请求数使用数据';
         await env.KV.put('usage.json', JSON.stringify(usage_json));
@@ -336,7 +372,7 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
     const cfg = { "Content-Type": "application/json" };
 
     try {
-        if (!AccountID && (!Email || !GlobalAPIKey)) return { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
+        if (!AccountID && (!Email || !GlobalAPIKey)) return { success: false, pages: 0, workers: 0, total: 0, max: 100000, dayPages: 0, dayWorkers: 0, dayTotal: 0, monthPages: 0, monthWorkers: 0, monthTotal: 0 };
 
         if (!AccountID) {
             const r = await fetch(`${API}/accounts`, {
@@ -350,10 +386,13 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
             AccountID = d.result[idx >= 0 ? idx : 0]?.id;
         }
 
-        // 修复点：统计当月1日至今的请求量
+        // 计算当天0点和当月1日0点（UTC时间）
         const now = new Date();
-        now.setUTCDate(1);              // 当月1日
-        now.setUTCHours(0, 0, 0, 0);    // 当天0点
+        const startOfDay = new Date(now);
+        startOfDay.setUTCHours(0, 0, 0, 0);
+        const startOfMonth = new Date(now);
+        startOfMonth.setUTCDate(1);
+        startOfMonth.setUTCHours(0, 0, 0, 0);
 
         const hdr = APIToken ? { ...cfg, "Authorization": `Bearer ${APIToken}` } : { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey };
 
@@ -361,13 +400,21 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
             method: "POST",
             headers: hdr,
             body: JSON.stringify({
-                query: `query getBillingMetrics($AccountID: String!, $filter: AccountWorkersInvocationsAdaptiveFilter_InputObject) {
-                    viewer { accounts(filter: {accountTag: $AccountID}) {
-                        pagesFunctionsInvocationsAdaptiveGroups(limit: 1000, filter: $filter) { sum { requests } }
-                        workersInvocationsAdaptive(limit: 10000, filter: $filter) { sum { requests } }
-                    } }
+                query: `query getBillingMetrics($AccountID: String!, $dayFilter: AccountWorkersInvocationsAdaptiveFilter_InputObject, $monthFilter: AccountWorkersInvocationsAdaptiveFilter_InputObject) {
+                    viewer {
+                        accounts(filter: {accountTag: $AccountID}) {
+                            pagesFunctionsInvocationsAdaptiveGroups(limit: 1000, filter: $dayFilter) { sum { requests } }
+                            workersInvocationsAdaptive(limit: 10000, filter: $dayFilter) { sum { requests } }
+                            monthPages: pagesFunctionsInvocationsAdaptiveGroups(limit: 1000, filter: $monthFilter) { sum { requests } }
+                            monthWorkers: workersInvocationsAdaptive(limit: 10000, filter: $monthFilter) { sum { requests } }
+                        }
+                    }
                 }`,
-                variables: { AccountID, filter: { datetime_geq: now.toISOString(), datetime_leq: new Date().toISOString() } }
+                variables: {
+                    AccountID,
+                    dayFilter: { datetime_geq: startOfDay.toISOString(), datetime_leq: now.toISOString() },
+                    monthFilter: { datetime_geq: startOfMonth.toISOString(), datetime_leq: now.toISOString() }
+                }
             })
         });
 
@@ -378,22 +425,41 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
         const acc = result?.data?.viewer?.accounts?.[0];
         if (!acc) throw new Error("未找到账户数据");
 
+        // 原有当日数据（兼容旧版）
         const pages = sum(acc.pagesFunctionsInvocationsAdaptiveGroups);
         const workers = sum(acc.workersInvocationsAdaptive);
-        const total = pages + workers;
-        const max = 100000;
-        console.log(`统计结果 - Pages: ${pages}, Workers: ${workers}, 总计: ${total}, 上限: 100000`);
-        return { success: true, pages, workers, total, max };
+        // 新增当月数据
+        const monthPages = sum(acc.monthPages);
+        const monthWorkers = sum(acc.monthWorkers);
+        const dayTotal = pages + workers;
+        const monthTotal = monthPages + monthWorkers;
+        const max = 100000; // 每日上限
+
+        console.log(`统计结果 - 当日 Pages: ${pages}, Workers: ${workers}, 总计: ${dayTotal}; 当月 Pages: ${monthPages}, Workers: ${monthWorkers}, 总计: ${monthTotal}`);
+
+        return {
+            success: true,
+            pages,          // 原有字段
+            workers,        // 原有字段
+            total: dayTotal, // 原有字段（当日总和）
+            max,            // 原有字段
+            dayPages: pages,
+            dayWorkers: workers,
+            dayTotal,
+            monthPages,
+            monthWorkers,
+            monthTotal
+        };
 
     } catch (error) {
         console.error('获取使用量错误:', error.message);
-        return { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
+        return { success: false, pages: 0, workers: 0, total: 0, max: 100000, dayPages: 0, dayWorkers: 0, dayTotal: 0, monthPages: 0, monthWorkers: 0, monthTotal: 0 };
     }
 }
 
 function 掩码敏感信息(文本, 前缀长度 = 3, 后缀长度 = 2) {
     if (!文本 || typeof 文本 !== 'string') return 文本;
-    if (文本.length <= 前缀长度 + 后缀长度) return 文本; // 如果长度太短，直接返回
+    if (文本.length <= 前缀长度 + 后缀长度) return 文本;
 
     const 前缀 = 文本.slice(0, 前缀长度);
     const 后缀 = 文本.slice(-后缀长度);
@@ -472,7 +538,7 @@ async function UsagePanel管理面板(TOKEN) {
 
         .top-nav {
             width: 100%;
-            max-width: 680px;
+            max-width: 600px; /* 与内容容器宽度一致 */
             display: flex;
             justify-content: flex-end;
             gap: 1rem;
@@ -511,7 +577,7 @@ async function UsagePanel管理面板(TOKEN) {
 
         .container {
             width: 100%;
-            max-width: 680px;
+            max-width: 600px;
             display: flex;
             flex-direction: column;
             gap: 1.5rem;
@@ -571,23 +637,81 @@ async function UsagePanel管理面板(TOKEN) {
             box-shadow: 0 8px 20px var(--primary-glow);
         }
 
-        /* Usage Section Styles (from homepage) */
-        .usage-section { margin-bottom: 2rem; position: relative; }
-        .usage-header { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 1rem; }
-        .label { font-size: 0.9rem; color: var(--text-muted); font-weight: 500; }
-        .percentage { font-family: 'Outfit', monospace; font-size: 1.25rem; font-weight: 600; color: var(--gradient-color, var(--text-main)); text-shadow: 0 0 20px var(--gradient-color-shadow, var(--primary-glow)); transition: color 0.6s ease, text-shadow 0.6s ease; }
-        .progress-track { background: var(--track-bg); border: 1px solid var(--stroke); border-radius: 999px; height: 14px; overflow: hidden; position: relative; }
-        .progress-bar { height: 100%; background: linear-gradient(90deg, #10b981 0%, #eab308 50%, #ef4444 100%); background-size: var(--bg-size, 100%); background-position: left; border-radius: 999px; width: 0%; transition: width 1.5s cubic-bezier(0.34, 1.56, 0.64, 1); position: relative; overflow: hidden; }
-        .progress-bar::after { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.4), transparent); transform: translateX(-100%); animation: shimmer 2.5s infinite; }
-        .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1.5rem; }
+        /* 汇总区域：两个进度条（今日/本月） */
+        .usage-section {
+            margin-bottom: 2rem;
+        }
+        .usage-item {
+            margin-bottom: 1.5rem;
+        }
+        .usage-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+            margin-bottom: 0.5rem;
+        }
+        .label {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+        .percentage {
+            font-family: 'Outfit', monospace;
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--gradient-color, var(--text-main));
+            text-shadow: 0 0 20px var(--gradient-color-shadow, var(--primary-glow));
+            transition: color 0.6s ease, text-shadow 0.6s ease;
+        }
+        .progress-track {
+            background: var(--track-bg);
+            border: 1px solid var(--stroke);
+            border-radius: 999px;
+            height: 14px;
+            overflow: hidden;
+            position: relative;
+        }
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #10b981 0%, #eab308 50%, #ef4444 100%);
+            background-size: var(--bg-size, 100%);
+            background-position: left;
+            border-radius: 999px;
+            width: 0%;
+            transition: width 1.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+            position: relative;
+            overflow: hidden;
+        }
+        .progress-bar::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.4), transparent);
+            transform: translateX(-100%);
+            animation: shimmer 2.5s infinite;
+        }
+        .total-text {
+            text-align: right;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-top: 0.25rem;
+        }
+
+        /* 细分卡片：显示今日/本月的 workers/pages 汇总 */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin-top: 1.5rem;
+        }
         .mini-card { 
             background: var(--item-bg); 
             border: 1px solid var(--stroke); 
             border-radius: 16px; 
             padding: 1rem 1.25rem; 
-            display: flex; 
-            align-items: center; 
-            gap: 1.25rem;
             transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); 
         }
         .mini-card:hover { 
@@ -596,32 +720,71 @@ async function UsagePanel管理面板(TOKEN) {
             border-color: var(--primary); 
             box-shadow: 0 10px 20px -5px rgba(0, 0, 0, 0.2);
         }
-        .mini-icon { font-size: 1.75rem; margin-bottom: 0; line-height: 1; }
-        .mini-info { display: flex; flex-direction: column; justify-content: center; }
-        .mini-label { font-size: 0.7rem; text-transform: uppercase; color: var(--text-muted); margin-bottom: 0; letter-spacing: 0.05em; font-weight: 500; }
-        .mini-value { font-size: 1.25rem; font-weight: 700; color: var(--text-main); line-height: 1.2; }
-        .total-text { text-align: right; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem; }
+        .mini-row {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+        .mini-row:last-child {
+            margin-bottom: 0;
+        }
+        .mini-icon {
+            font-size: 1.5rem;
+            width: 2rem;
+            text-align: center;
+        }
+        .mini-info {
+            flex: 1;
+        }
+        .mini-label {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 0;
+            letter-spacing: 0.05em;
+            font-weight: 500;
+        }
+        .mini-value {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: var(--text-main);
+            line-height: 1.2;
+        }
 
-        /* Account List Styles */
-        .account-list { display: flex; flex-direction: column; gap: 1rem; }
+        /* 账号列表卡片样式 */
         .account-item {
             background: var(--item-bg);
             border: 1px solid var(--stroke);
             border-radius: 20px;
             padding: 1.5rem;
-            display: flex;
-            flex-direction: column;
-            gap: 1.25rem;
+            margin-bottom: 1rem;
             transition: all 0.3s ease;
         }
         .account-item:hover {
             border-color: rgba(99, 102, 241, 0.3);
             background: rgba(99, 102, 241, 0.02);
         }
-        .account-info { display: flex; justify-content: space-between; align-items: center; }
-        .account-name { font-weight: 600; font-size: 1.1rem; color: var(--text-main); display: flex; align-items: center; gap: 0.5rem; }
-        .account-id { font-size: 0.8rem; color: var(--text-muted); font-family: monospace; }
-        
+        .account-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start; /* 修改为顶部对齐，使删除按钮与账号名称顶部持平 */
+            margin-bottom: 1rem;
+        }
+        .account-name {
+            font-weight: 600;
+            font-size: 1.1rem;
+            color: var(--text-main);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .account-id {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            font-family: monospace;
+            margin-top: 4px;
+        }
         .delete-btn {
             padding: 0.5rem 1rem;
             background: rgba(239, 68, 68, 0.1);
@@ -640,7 +803,56 @@ async function UsagePanel管理面板(TOKEN) {
             box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
         }
 
-        /* Modal Styles */
+        /* 浅色模式下删除按钮颜色加深 */
+        :root.light-mode .delete-btn {
+            background: rgba(239, 68, 68, 0.25);
+            border-color: rgba(239, 68, 68, 0.5);
+            color: #b91c1c;
+        }
+
+        /* 账号内的两个进度条（当日和当月） */
+        .account-usage {
+            margin-top: 1rem;
+        }
+        .account-usage-item {
+            margin-bottom: 1rem;
+        }
+        .account-usage-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.25rem;
+            font-size: 0.85rem;
+        }
+        .account-usage-bar {
+            background: var(--track-bg);
+            border: 1px solid var(--stroke);
+            border-radius: 999px;
+            height: 6px;
+            overflow: hidden;
+        }
+        .account-usage-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #10b981, #eab308, #ef4444);
+            background-size: 200% 100%;
+            width: 0%;
+            transition: width 1s ease;
+        }
+        .account-details {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 0.5rem;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            border-top: 1px dashed var(--stroke);
+            padding-top: 0.5rem;
+        }
+        .account-details span {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+
+        /* 模态框样式 */
         .modal-overlay {
             position: fixed;
             top: 0; left: 0; right: 0; bottom: 0;
@@ -667,7 +879,7 @@ async function UsagePanel管理面板(TOKEN) {
         .modal h3 { margin-bottom: 1.5rem; text-align: center; }
         .input-group { margin-bottom: 1rem; }
         .input-group label { display: block; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem; }
-        .input-group input {
+        .input-group input, .input-group select {
             width: 100%;
             padding: 0.75rem 1rem;
             background: var(--input-bg);
@@ -677,7 +889,12 @@ async function UsagePanel管理面板(TOKEN) {
             outline: none;
             transition: border-color 0.3s;
         }
-        .input-group input:focus { border-color: var(--primary); }
+        .input-group select {
+            appearance: none;
+            -webkit-appearance: none;
+            cursor: pointer;
+        }
+        .input-group input:focus, .input-group select:focus { border-color: var(--primary); }
         .modal-actions { display: flex; gap: 1rem; margin-top: 1.5rem; }
         .modal-btn { flex: 1; padding: 0.75rem; border-radius: 12px; cursor: pointer; font-weight: 600; border: none; transition: all 0.3s; }
         .modal-btn.cancel { background: rgba(255, 255, 255, 0.05); color: var(--text-main); }
@@ -729,211 +946,85 @@ async function UsagePanel管理面板(TOKEN) {
             color: var(--footer-color);
             transition: color 0.3s;
         }
-        
         .footer:hover {
             color: var(--footer-hover);
         }
-
         a.footer {
             color: inherit;
             text-decoration: none;
         }
-
         a.footer:hover {
             text-decoration: underline;
         }
 
-        /* ============ 移动端响应式布局 ============ */
+        /* 响应式 */
         @media (max-width: 768px) {
-            body {
-                padding: 1rem;
-            }
-
-            .top-nav {
-                flex-wrap: wrap;
-                gap: 0.5rem;
-                margin-bottom: 1.5rem;
-            }
-
-            .nav-btn {
-                padding: 0.5rem 0.8rem;
-                font-size: 0.8rem;
-                border-radius: 10px;
-                flex: 1;
-                min-width: calc(50% - 0.25rem);
-                justify-content: center;
-            }
-
-            .nav-btn svg {
-                width: 16px;
-                height: 16px;
-            }
-
-            .container {
-                gap: 1.5rem;
-            }
-
-            .glass-card {
-                padding: 1.5rem;
-                border-radius: 20px;
-            }
-
-            h1, h2 {
-                font-size: 1.25rem;
-                margin-bottom: 1rem;
-            }
-
-            .module-header {
-                flex-direction: column;
-                align-items: flex-start;
-                gap: 1rem;
-                margin-bottom: 1.5rem;
-            }
-
-            .add-btn {
-                width: 100%;
-                padding: 0.7rem 1rem;
-            }
-
+            body { padding: 1rem; }
+            .top-nav { flex-wrap: wrap; gap: 0.5rem; }
+            .nav-btn { padding: 0.5rem 0.8rem; font-size: 0.8rem; flex: 1; min-width: calc(50% - 0.25rem); justify-content: center; }
+            .container { gap: 1.5rem; }
+            .glass-card { padding: 1.5rem; }
+            h1, h2 { font-size: 1.25rem; }
+            .module-header { flex-direction: column; align-items: flex-start; gap: 1rem; }
+            .add-btn { width: 100%; }
+            
+            /* 统计卡片改为单列，每个卡片内今日/本月并排显示 */
             .stats-grid {
-                grid-template-columns: 1fr;
+                grid-template-columns: 1fr; /* 单列 */
                 gap: 0.75rem;
-                margin-top: 1rem;
             }
-
             .mini-card {
-                padding: 1rem;
-                gap: 1rem;
+                display: flex;
+                flex-wrap: wrap;
+                padding: 0.75rem 1rem;
             }
-
-            .mini-icon {
-                font-size: 1.5rem;
+            .mini-card .mini-row {
+                flex: 1 1 50%; /* 每个子项占一半宽度 */
+                margin-bottom: 0;
+                padding: 0 0.25rem;
+                box-sizing: border-box;
             }
-
-            .mini-label {
+            .mini-card .mini-row .mini-icon {
+                font-size: 1.2rem;
+                width: 1.8rem;
+            }
+            .mini-card .mini-row .mini-label {
                 font-size: 0.65rem;
             }
-
-            .mini-value {
-                font-size: 1.1rem;
+            .mini-card .mini-row .mini-value {
+                font-size: 0.9rem;
             }
+            
+            .modal { max-width: calc(100% - 2rem); padding: 1.5rem; }
 
-            .account-item {
-                padding: 1.25rem;
-                border-radius: 16px;
-                gap: 1rem;
-            }
-
+            /* 优化账号项，确保删除按钮与名称同行并缩小 */
             .account-info {
-                flex-direction: column;
+                flex-wrap: nowrap;
+                gap: 0.5rem;
                 align-items: flex-start;
-                gap: 1rem;
             }
-
+            .account-info > div:first-child {
+                flex: 1;
+                min-width: 0;
+                word-break: break-word;
+                display: flex;
+                flex-wrap: wrap;
+                align-items: baseline;
+                gap: 0.25rem 0.5rem;
+            }
+            /* ID和更新时间尽量显示完整，必要时换行 */
+            .account-info .account-id {
+                margin-top: 0 !important;
+                white-space: normal;      /* 允许换行 */
+                word-break: break-word;   /* 长单词换行 */
+                max-width: 100%;
+                font-size: 0.7rem;        /* 稍微减小字体以容纳更多内容 */
+            }
             .delete-btn {
-                width: 100%;
-                text-align: center;
-                padding: 0.6rem 1rem;
-            }
-
-            .usage-header {
-                flex-direction: column;
-                align-items: flex-start;
-                gap: 0.5rem;
-            }
-
-            .percentage {
-                font-size: 1.1rem;
-            }
-
-            .modal {
-                max-width: calc(100% - 2rem);
-                padding: 1.5rem;
-                border-radius: 20px;
-            }
-
-            .modal h3 {
-                font-size: 1.1rem;
-                margin-bottom: 1.25rem;
-            }
-
-            .input-group {
-                margin-bottom: 0.875rem;
-            }
-
-            .input-group input {
-                padding: 0.65rem 0.875rem;
-                font-size: 0.9rem;
-            }
-
-            .modal-actions {
-                gap: 0.75rem;
-                margin-top: 1.25rem;
-            }
-
-            .modal-btn {
-                padding: 0.65rem;
-                font-size: 0.9rem;
-            }
-
-            .toast {
-                bottom: 1rem;
-                right: 1rem;
-                left: 1rem;
-                padding: 0.875rem 1.25rem;
-                font-size: 0.875rem;
-                border-radius: 10px;
-            }
-
-            .footer {
-                margin-top: 2rem;
+                padding: 0.3rem 0.6rem;
                 font-size: 0.7rem;
-            }
-
-            .total-text {
-                font-size: 0.75rem;
-            }
-
-            .account-id {
-                font-size: 0.75rem;
-                word-break: break-all;
-            }
-        }
-
-        /* 超小屏幕优化 */
-        @media (max-width: 420px) {
-            body {
-                padding: 0.75rem;
-            }
-
-            .glass-card {
-                padding: 1.25rem;
-                border-radius: 18px;
-            }
-
-            h1, h2 {
-                font-size: 1.1rem;
-            }
-
-            .nav-btn {
-                min-width: 100%;
-                font-size: 0.75rem;
-            }
-
-            .stats-grid {
-                gap: 0.5rem;
-            }
-
-            .mini-card {
-                padding: 0.875rem;
-            }
-
-            .account-item {
-                padding: 1rem;
-            }
-
-            .modal {
-                padding: 1.25rem;
+                white-space: nowrap;
+                flex-shrink: 0;
             }
         }
     </style>
@@ -988,7 +1079,7 @@ async function UsagePanel管理面板(TOKEN) {
             </div>
             <div class="input-group">
                 <label>验证方式</label>
-                <select id="authMethod" onchange="switchAuthMethod()" style="width: 100%; padding: 0.75rem 1rem; background: var(--input-bg); border: 1px solid var(--stroke); border-radius: 12px; color: var(--text-main); outline: none; cursor: pointer; appearance: none; -webkit-appearance: none;">
+                <select id="authMethod" onchange="switchAuthMethod()">
                     <option value="token">Account ID + API Token</option>
                     <option value="global">Email + Global API Key</option>
                 </select>
@@ -1047,7 +1138,7 @@ async function UsagePanel管理面板(TOKEN) {
         }
 
         initTheme();
-        
+
         function showToast(msg) {
             const toast = document.getElementById('toast');
             toast.textContent = msg;
@@ -1075,41 +1166,32 @@ async function UsagePanel管理面板(TOKEN) {
         // 根据百分比计算颜色（绿 -> 黄 -> 红）
         function getGradientColor(percent) {
             percent = Math.max(0, Math.min(100, percent));
-            
             let r, g, b;
-            
             if (percent <= 50) {
-                // 绿色 (16, 185, 129) 到 黄色 (234, 179, 8)
                 const t = percent / 50;
                 r = Math.round(16 + (234 - 16) * t);
                 g = Math.round(185 + (179 - 185) * t);
                 b = Math.round(129 - 129 * t);
             } else {
-                // 黄色 (234, 179, 8) 到 红色 (239, 68, 68)
                 const t = (percent - 50) / 50;
                 r = Math.round(234 + (239 - 234) * t);
                 g = Math.round(179 - 179 * t);
                 b = Math.round(8 + (68 - 8) * t);
             }
-            
             return \`rgb(\${r}, \${g}, \${b})\`;
         }
 
-        // 获取对应百分比的色阴影
         function getGradientShadow(percent) {
             const color = getGradientColor(percent);
             const rgb = color.match(/\\d+/g);
             return \`rgba(\${rgb[0]}, \${rgb[1]}, \${rgb[2]}, 0.4)\`;
         }
 
-        // 应用颜色到进度条容器
         function applyGradientColor(container, percent) {
             const color = getGradientColor(percent);
             const shadow = getGradientShadow(percent);
             container.style.setProperty('--gradient-color', color);
             container.style.setProperty('--gradient-color-shadow', \`0 0 20px \${shadow}\`);
-            
-            // 设置进度条背景大小，让渐变正确显示
             const bar = container.querySelector('.progress-bar');
             if (bar && percent > 0) {
                 const bgSize = (100 / percent) * 100;
@@ -1117,61 +1199,107 @@ async function UsagePanel管理面板(TOKEN) {
             }
         }
 
+        // 获取汇总数据并渲染两个进度条及细分卡片
         async function fetchSummary() {
             const container = document.getElementById('summary-content');
             try {
                 const res = await fetch('./admin/usage.json?t=' + Date.now());
                 const data = await res.json();
-                
-                const total = data.total || 0;
-                const max = data.max || 100000;
-                const percent = Math.min((total / max) * 100, 100).toFixed(1);
-                
+
+                const dayTotal = data.dayTotal || 0;
+                const monthTotal = data.monthTotal || 0;
+                const dayMax = data.max || 100000;      // 所有账号每日上限总和
+                const monthMax = data.monthMax || 0;    // 所有账号当月上限总和（账号数 * 300万）
+
+                const dayPercent = dayMax > 0 ? Math.min((dayTotal / dayMax) * 100, 100).toFixed(1) : 0;
+                const monthPercent = monthMax > 0 ? Math.min((monthTotal / monthMax) * 100, 100).toFixed(1) : 0;
+
+                // 修改点：将 dayMax 的显示从 "k" 改为 "万"
                 container.innerHTML = \`
                     <div class="usage-section">
-                        <div class="usage-header">
-                            <span class="label">总请求占比</span>
-                            <span class="percentage">\${percent}%</span>
+                        <div class="usage-item">
+                            <div class="usage-header">
+                                <span class="label">今日请求（每日上限合计 \${(dayMax/10000).toFixed(1)}万）</span>
+                                <span class="percentage">\${dayPercent}%</span>
+                            </div>
+                            <div class="progress-track">
+                                <div class="progress-bar" style="width: 0%"></div>
+                            </div>
+                            <div class="total-text">
+                                \${dayTotal.toLocaleString()} / \${dayMax.toLocaleString()} 今日已用
+                            </div>
                         </div>
-                        <div class="progress-track">
-                            <div class="progress-bar" style="width: \${percent}%"></div>
-                        </div>
-                        <div class="total-text">
-                            \${total.toLocaleString()} / \${max.toLocaleString()} 总计请求
+                        <div class="usage-item">
+                            <div class="usage-header">
+                                <span class="label">本月请求（每月上限合计 \${(monthMax/10000).toFixed(0)} 万）</span>
+                                <span class="percentage">\${monthPercent}%</span>
+                            </div>
+                            <div class="progress-track">
+                                <div class="progress-bar" style="width: 0%"></div>
+                            </div>
+                            <div class="total-text">
+                                \${monthTotal.toLocaleString()} / \${monthMax.toLocaleString()} 本月累计
+                            </div>
                         </div>
                     </div>
                     <div class="stats-grid">
                         <div class="mini-card">
-                            <div class="mini-icon">🔶</div>
-                            <div class="mini-info">
-                                <div class="mini-label">Workers</div>
-                                <div class="mini-value">\${(data.workers || 0).toLocaleString()}</div>
+                            <div class="mini-row">
+                                <div class="mini-icon">🔶</div>
+                                <div class="mini-info">
+                                    <div class="mini-label">Workers (今日)</div>
+                                    <div class="mini-value">\${(data.dayWorkers || 0).toLocaleString()}</div>
+                                </div>
+                            </div>
+                            <div class="mini-row">
+                                <div class="mini-icon">🔶</div>
+                                <div class="mini-info">
+                                    <div class="mini-label">Workers (本月)</div>
+                                    <div class="mini-value">\${(data.monthWorkers || 0).toLocaleString()}</div>
+                                </div>
                             </div>
                         </div>
                         <div class="mini-card">
-                            <div class="mini-icon">⚡️</div>
-                            <div class="mini-info">
-                                <div class="mini-label">Pages</div>
-                                <div class="mini-value">\${(data.pages || 0).toLocaleString()}</div>
+                            <div class="mini-row">
+                                <div class="mini-icon">⚡️</div>
+                                <div class="mini-info">
+                                    <div class="mini-label">Pages (今日)</div>
+                                    <div class="mini-value">\${(data.dayPages || 0).toLocaleString()}</div>
+                                </div>
+                            </div>
+                            <div class="mini-row">
+                                <div class="mini-icon">⚡️</div>
+                                <div class="mini-info">
+                                    <div class="mini-label">Pages (本月)</div>
+                                    <div class="mini-value">\${(data.monthPages || 0).toLocaleString()}</div>
+                                </div>
                             </div>
                         </div>
                     </div>
                 \`;
-                
-                // 应用颜色到百分数
-                const usageSection = container.querySelector('.usage-section');
-                applyGradientColor(usageSection, percent);
+
+                const usageItems = container.querySelectorAll('.usage-item');
+                if (usageItems.length >= 2) {
+                    applyGradientColor(usageItems[0], dayPercent);
+                    applyGradientColor(usageItems[1], monthPercent);
+                }
+                requestAnimationFrame(() => {
+                    const bars = container.querySelectorAll('.progress-bar');
+                    if (bars[0]) bars[0].style.width = dayPercent + '%';
+                    if (bars[1]) bars[1].style.width = monthPercent + '%';
+                });
             } catch (err) {
                 container.innerHTML = '<div style="color: var(--danger)">加载汇总数据失败</div>';
             }
         }
 
+        // 获取账号配置列表并渲染（每个账号显示当日进度条 + 当月进度条 + 详细数值）
         async function fetchConfig() {
             const container = document.getElementById('config-content');
             try {
                 const res = await fetch('./admin/config.json?t=' + Date.now());
                 const data = await res.json();
-                
+
                 if (data.length === 0) {
                     container.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 2rem;">暂无账号，请点击上方按钮添加</div>';
                     return;
@@ -1179,13 +1307,16 @@ async function UsagePanel管理面板(TOKEN) {
 
                 container.innerHTML = '<div class="account-list">' + data.map(acc => {
                     const usage = acc.Usage || {};
-                    const total = usage.total || 0;
-                    const max = usage.max || 100000;
-                    const percent = Math.min((total / max) * 100, 100).toFixed(1);
+                    const dayTotal = usage.dayTotal || 0;
+                    const monthTotal = usage.monthTotal || 0;
+                    const dayMax = 100000; // 每个账号每日上限
+                    const monthMax = 3000000; // 每个账号每月上限
+                    const dayPercent = Math.min((dayTotal / dayMax) * 100, 100).toFixed(1);
+                    const monthPercent = Math.min((monthTotal / monthMax) * 100, 100).toFixed(1);
+                    const dayColor = getGradientColor(dayPercent);
+                    const monthColor = getGradientColor(monthPercent);
                     const updateTime = acc.UpdateTime ? new Date(acc.UpdateTime).toLocaleString() : '从未更新';
-                    const percentColor = getGradientColor(percent);
-                    const bgSize = percent > 0 ? (100 / percent) * 100 : 100;
-                    
+
                     return \`
                         <div class="account-item">
                             <div class="account-info">
@@ -1196,25 +1327,60 @@ async function UsagePanel管理面板(TOKEN) {
                                 </div>
                                 <button class="delete-btn" onclick="deleteAccount(\${acc.ID})">删除账号</button>
                             </div>
-                            <div class="usage-section" style="margin-bottom: 0">
-                                <div class="usage-header">
-                                    <span class="label">请求使用情况: \${total.toLocaleString()} / \${max.toLocaleString()} <b style="color: \${percentColor}; margin-left: 4px;">\${percent}%</b></span>
-                                    <span class="label" style="font-size: 0.8rem; font-variant-numeric: tabular-nums;">
-                                        W: \${(usage.workers || 0).toLocaleString()} | P: \${(usage.pages || 0).toLocaleString()}
-                                    </span>
+                            <div class="account-usage">
+                                <!-- 当日进度条 -->
+                                <div class="account-usage-item">
+                                    <div class="account-usage-header">
+                                        <span>📅 今日用量 (上限 10万)</span>
+                                        <span style="color:\${dayColor};">\${dayPercent}%</span>
+                                    </div>
+                                    <div class="account-usage-bar">
+                                        <div class="account-usage-fill day-fill" style="width: 0%"></div>
+                                    </div>
                                 </div>
-                                <div class="progress-track" style="height: 8px">
-                                    <div class="progress-bar" style="width: \${percent}%; --bg-size: \${bgSize}%"></div>
+                                <!-- 当月进度条 -->
+                                <div class="account-usage-item">
+                                    <div class="account-usage-header">
+                                        <span>📆 本月用量 (上限 300万)</span>
+                                        <span style="color:\${monthColor};">\${monthPercent}%</span>
+                                    </div>
+                                    <div class="account-usage-bar">
+                                        <div class="account-usage-fill month-fill" style="width: 0%"></div>
+                                    </div>
+                                </div>
+                                <!-- 详细数值 -->
+                                <div class="account-details">
+                                    <span>🔶 W: 今日 \${(usage.dayWorkers || 0).toLocaleString()} / 本月 \${(usage.monthWorkers || 0).toLocaleString()}</span>
+                                    <span>⚡️ P: 今日 \${(usage.dayPages || 0).toLocaleString()} / 本月 \${(usage.monthPages || 0).toLocaleString()}</span>
                                 </div>
                             </div>
                         </div>
                     \`;
                 }).join('') + '</div>';
+
+                // 设置每个账号的进度条宽度
+                requestAnimationFrame(() => {
+                    const dayFills = container.querySelectorAll('.day-fill');
+                    const monthFills = container.querySelectorAll('.month-fill');
+                    data.forEach((acc, index) => {
+                        if (dayFills[index]) {
+                            const dayTotal = acc.Usage?.dayTotal || 0;
+                            const dayPercent = Math.min((dayTotal / 100000) * 100, 100);
+                            dayFills[index].style.width = dayPercent + '%';
+                        }
+                        if (monthFills[index]) {
+                            const monthTotal = acc.Usage?.monthTotal || 0;
+                            const monthPercent = Math.min((monthTotal / 3000000) * 100, 100);
+                            monthFills[index].style.width = monthPercent + '%';
+                        }
+                    });
+                });
             } catch (err) {
                 container.innerHTML = '<div style="color: var(--danger)">加载详情数据失败</div>';
             }
         }
 
+        // 模态框相关函数
         function openAddModal() { 
             document.getElementById('addModal').classList.add('active'); 
             document.getElementById('authMethod').value = 'token';
@@ -1239,7 +1405,7 @@ async function UsagePanel管理面板(TOKEN) {
         async function handleAddAccount() {
             const name = document.getElementById('newName').value;
             const method = document.getElementById('authMethod').value;
-            
+
             let accountID = null, apiToken = null, email = null, globalAPIKey = null;
 
             if (method === 'token') {
@@ -1288,7 +1454,7 @@ async function UsagePanel管理面板(TOKEN) {
 
         async function deleteAccount(id) {
             if (!confirm('确定要删除这个账号吗？')) return;
-            
+
             try {
                 const res = await fetch('./api/del', {
                     method: 'POST',
@@ -1438,34 +1604,28 @@ async function UsagePanel主页(TOKEN) {
         }
 
         @keyframes statusPulse {
-            0%, 100% {
-                box-shadow: 0 0 8px var(--primary), 0 0 0 0 rgba(129, 140, 248, 0.7);
-                transform: scale(1);
-            }
-            50% {
-                box-shadow: 0 0 12px var(--primary), 0 0 0 6px rgba(129, 140, 248, 0);
-                transform: scale(1.2);
-            }
+            0%, 100% { box-shadow: 0 0 8px var(--primary), 0 0 0 0 rgba(129, 140, 248, 0.7); transform: scale(1); }
+            50% { box-shadow: 0 0 12px var(--primary), 0 0 0 6px rgba(129, 140, 248, 0); transform: scale(1.2); }
         }
 
+        /* 上下两个进度条区域 */
         .usage-section {
             margin-bottom: 2rem;
-            position: relative;
         }
-
+        .usage-item {
+            margin-bottom: 1.5rem;
+        }
         .usage-header {
             display: flex;
             justify-content: space-between;
             align-items: flex-end;
-            margin-bottom: 1rem;
+            margin-bottom: 0.5rem;
         }
-
         .label {
             font-size: 0.9rem;
             color: var(--text-muted);
             font-weight: 500;
         }
-
         .percentage {
             font-family: 'Outfit', monospace;
             font-size: 1.25rem;
@@ -1474,7 +1634,6 @@ async function UsagePanel主页(TOKEN) {
             text-shadow: 0 0 20px var(--gradient-color-shadow, var(--primary-glow));
             transition: color 0.6s ease, text-shadow 0.6s ease;
         }
-
         .progress-track {
             background: var(--track-bg);
             border: 1px solid var(--stroke);
@@ -1484,7 +1643,6 @@ async function UsagePanel主页(TOKEN) {
             position: relative;
             box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
         }
-
         .progress-bar {
             height: 100%;
             background: linear-gradient(90deg, #10b981 0%, #eab308 50%, #ef4444 100%);
@@ -1496,7 +1654,6 @@ async function UsagePanel主页(TOKEN) {
             position: relative;
             overflow: hidden;
         }
-        
         .progress-bar::after {
             content: '';
             position: absolute;
@@ -1505,22 +1662,26 @@ async function UsagePanel主页(TOKEN) {
             transform: translateX(-100%);
             animation: shimmer 2.5s infinite;
         }
+        .total-text {
+            text-align: right;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-top: 0.25rem;
+            font-variant-numeric: tabular-nums;
+        }
 
+        /* 细分卡片：两行显示今日/本月 */
         .stats-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 1rem;
             margin-top: 1.5rem;
         }
-
         .mini-card { 
             background: var(--item-bg); 
             border: 1px solid var(--stroke); 
             border-radius: 16px; 
             padding: 1rem 1.25rem; 
-            display: flex; 
-            align-items: center; 
-            gap: 1.25rem;
             transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); 
             position: relative;
             overflow: hidden;
@@ -1531,13 +1692,24 @@ async function UsagePanel主页(TOKEN) {
             border-color: var(--primary); 
             box-shadow: 0 10px 20px -5px rgba(0, 0, 0, 0.2);
         }
-        .mini-icon { 
-            font-size: 1.75rem; 
-            margin-bottom: 0; 
-            line-height: 1;
+        .mini-row {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+        .mini-row:last-child {
+            margin-bottom: 0;
+        }
+        .mini-icon {
+            font-size: 1.5rem;
+            width: 2rem;
+            text-align: center;
             filter: drop-shadow(0 0 10px rgba(255,255,255,0.1));
         }
-        .mini-info { display: flex; flex-direction: column; justify-content: center; }
+        .mini-info {
+            flex: 1;
+        }
         .mini-label { 
             font-size: 0.7rem; 
             text-transform: uppercase; 
@@ -1547,18 +1719,10 @@ async function UsagePanel主页(TOKEN) {
             font-weight: 500;
         }
         .mini-value { 
-            font-size: 1.25rem; 
+            font-size: 1.1rem; 
             font-weight: 700; 
             color: var(--text-main); 
             line-height: 1.2;
-        }
-
-        .total-text {
-            text-align: right;
-            font-size: 0.8rem;
-            color: var(--text-muted);
-            margin-top: 0.5rem;
-            font-variant-numeric: tabular-nums;
         }
 
         .footer {
@@ -1568,7 +1732,6 @@ async function UsagePanel主页(TOKEN) {
             color: var(--footer-color);
             transition: color 0.3s;
         }
-        
         .footer:hover {
             color: var(--footer-hover);
         }
@@ -1590,240 +1753,14 @@ async function UsagePanel主页(TOKEN) {
             transition: all 0.3s ease;
             z-index: 1001;
         }
-
         .admin-bubble:hover {
             transform: scale(1.1);
             box-shadow: 0 12px 32px rgba(99, 102, 241, 0.5);
         }
-
         .admin-bubble svg {
             width: 24px;
             height: 24px;
             fill: white;
-        }
-
-        /* 登录模态框 */
-        .login-modal-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.6);
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
-            display: none;
-            justify-content: center;
-            align-items: center;
-            z-index: 2000;
-            animation: fadeIn 0.3s ease;
-        }
-
-        .login-modal-overlay.active {
-            display: flex;
-        }
-
-        .login-modal {
-            background: var(--card-bg);
-            backdrop-filter: blur(24px);
-            -webkit-backdrop-filter: blur(24px);
-            border: 1px solid var(--stroke);
-            border-radius: 20px;
-            padding: 2rem;
-            max-width: 360px;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            animation: modalSlideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; }
-            to { opacity: 1; }
-        }
-
-        @keyframes modalSlideUp {
-            from { opacity: 0; transform: translateY(30px) scale(0.95); }
-            to { opacity: 1; transform: translateY(0) scale(1); }
-        }
-
-        .login-modal h2 {
-            font-size: 1.25rem;
-            font-weight: 600;
-            margin-bottom: 1.5rem;
-            text-align: center;
-            background: var(--heading-grad);
-            -webkit-background-clip: text;
-            background-clip: text;
-            color: transparent;
-        }
-
-        .login-input {
-            width: 100%;
-            padding: 0.875rem 1rem;
-            background: rgba(0, 0, 0, 0.2);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 12px;
-            color: var(--text-main);
-            font-size: 1rem;
-            font-family: 'Outfit', sans-serif;
-            outline: none;
-            transition: all 0.3s ease;
-            margin-bottom: 1rem;
-        }
-
-        .login-input:focus {
-            border-color: var(--primary);
-            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
-        }
-
-        .login-input::placeholder {
-            color: var(--text-muted);
-        }
-
-        :root.light-mode .login-input {
-            background: rgba(79, 70, 229, 0.08);
-            border-color: rgba(79, 70, 229, 0.2);
-        }
-
-        :root.light-mode .login-input:focus {
-            box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.15);
-        }
-
-        .login-btn {
-            width: 100%;
-            padding: 0.875rem;
-            background: linear-gradient(135deg, var(--primary), var(--accent));
-            border: none;
-            border-radius: 12px;
-            color: white;
-            font-size: 1rem;
-            font-weight: 600;
-            font-family: 'Outfit', sans-serif;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-
-        .login-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 24px rgba(99, 102, 241, 0.4);
-        }
-
-        :root.light-mode .login-btn:hover {
-            box-shadow: 0 8px 24px rgba(79, 70, 229, 0.35);
-        }
-
-        .login-btn:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
-        }
-
-        .login-error {
-            background: rgba(239, 68, 68, 0.15);
-            color: #fca5a5;
-            padding: 0.75rem 1rem;
-            border-radius: 10px;
-            font-size: 0.85rem;
-            margin-bottom: 1rem;
-            border: 1px solid rgba(239, 68, 68, 0.2);
-            text-align: center;
-            display: none;
-        }
-
-        .login-error.show {
-            display: block;
-            animation: shake 0.4s ease;
-        }
-
-        :root.light-mode .login-error {
-            background: rgba(239, 68, 68, 0.08);
-            color: #dc2626;
-            border-color: rgba(239, 68, 68, 0.3);
-        }
-
-        @keyframes shake {
-            0%, 100% { transform: translateX(0); }
-            25% { transform: translateX(-8px); }
-            75% { transform: translateX(8px); }
-        }
-
-        .close-modal {
-            position: absolute;
-            top: 1rem;
-            right: 1rem;
-            width: 32px;
-            height: 32px;
-            background: rgba(255, 255, 255, 0.1);
-            border: none;
-            border-radius: 50%;
-            color: var(--text-muted);
-            font-size: 1.25rem;
-            cursor: pointer;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            transition: all 0.3s ease;
-        }
-
-        .close-modal:hover {
-            background: rgba(255, 255, 255, 0.2);
-            color: white;
-        }
-
-        .login-modal-wrapper {
-            position: relative;
-        }
-
-        .toast-notification {
-            position: fixed;
-            bottom: 2rem;
-            right: 2rem;
-            background: linear-gradient(135deg, rgba(168, 85, 247, 0.95), rgba(99, 102, 241, 0.95));
-            backdrop-filter: blur(24px);
-            -webkit-backdrop-filter: blur(24px);
-            border: 1px solid rgba(168, 85, 247, 0.5);
-            border-radius: 12px;
-            padding: 1.25rem 1.5rem;
-            color: #fff;
-            font-size: 0.95rem;
-            font-weight: 500;
-            box-shadow: 0 15px 35px rgba(168, 85, 247, 0.3), 0 0 1px rgba(255,255,255,0.1) inset;
-            animation: toastSlideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-            z-index: 1000;
-            max-width: 300px;
-            word-break: break-word;
-        }
-
-        @keyframes toastSlideIn {
-            from { opacity: 0; transform: translateX(30px) translateY(30px); }
-            to { opacity: 1; transform: translateX(0) translateY(0); }
-        }
-
-        .loading-container {
-            min-height: 200px;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            gap: 1rem;
-        }
-
-        .spinner {
-            width: 40px;
-            height: 40px;
-            border: 3px solid rgba(255, 255, 255, 0.1);
-            border-radius: 50%;
-            border-top-color: var(--primary);
-            animation: spin 1s ease-in-out infinite;
-        }
-
-        .error-msg {
-            background: rgba(239, 68, 68, 0.15);
-            color: #fca5a5;
-            padding: 1rem;
-            border-radius: 12px;
-            font-size: 0.9rem;
-            border: 1px solid rgba(239, 68, 68, 0.2);
-            text-align: center;
         }
 
         /* 主题切换气泡 */
@@ -1846,402 +1783,210 @@ async function UsagePanel主页(TOKEN) {
             z-index: 1001;
             color: var(--text-main);
         }
-
         .theme-bubble:hover {
             transform: scale(1.1);
             border-color: var(--primary);
         }
-
         .theme-bubble svg { width: 22px; height: 22px; stroke: currentColor; }
 
-        @keyframes slideUp {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
+        /* 登录模态框 */
+        .login-modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(8px);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 2000;
+            animation: fadeIn 0.3s ease;
+        }
+        .login-modal-overlay.active { display: flex; }
+        .login-modal {
+            background: var(--card-bg);
+            backdrop-filter: blur(24px);
+            border: 1px solid var(--stroke);
+            border-radius: 20px;
+            padding: 2rem;
+            max-width: 360px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            animation: modalSlideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+            position: relative;
+        }
+        .login-modal h2 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 1.5rem;
+            text-align: center;
+            background: var(--heading-grad);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+        }
+        .login-input {
+            width: 100%;
+            padding: 0.875rem 1rem;
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            color: var(--text-main);
+            font-size: 1rem;
+            font-family: 'Outfit', sans-serif;
+            outline: none;
+            transition: all 0.3s ease;
+            margin-bottom: 1rem;
+        }
+        .login-input:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+        }
+        .login-btn {
+            width: 100%;
+            padding: 0.875rem;
+            background: linear-gradient(135deg, var(--primary), var(--accent));
+            border: none;
+            border-radius: 12px;
+            color: white;
+            font-size: 1rem;
+            font-weight: 600;
+            font-family: 'Outfit', sans-serif;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        .login-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(99, 102, 241, 0.4);
+        }
+        .login-btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+        .login-error {
+            background: rgba(239, 68, 68, 0.15);
+            color: #fca5a5;
+            padding: 0.75rem 1rem;
+            border-radius: 10px;
+            font-size: 0.85rem;
+            margin-bottom: 1rem;
+            border: 1px solid rgba(239, 68, 68, 0.2);
+            text-align: center;
+            display: none;
+        }
+        .login-error.show { display: block; animation: shake 0.4s ease; }
+        .close-modal {
+            position: absolute;
+            top: 1rem;
+            right: 1rem;
+            width: 32px;
+            height: 32px;
+            background: rgba(255, 255, 255, 0.1);
+            border: none;
+            border-radius: 50%;
+            color: var(--text-muted);
+            font-size: 1.25rem;
+            cursor: pointer;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            transition: all 0.3s ease;
+        }
+        .close-modal:hover {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
         }
 
-        @keyframes spin {
-            to { transform: rotate(360deg); }
+        .toast-notification {
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            background: linear-gradient(135deg, rgba(168, 85, 247, 0.95), rgba(99, 102, 241, 0.95));
+            backdrop-filter: blur(24px);
+            border: 1px solid rgba(168, 85, 247, 0.5);
+            border-radius: 12px;
+            padding: 1.25rem 1.5rem;
+            color: #fff;
+            font-size: 0.95rem;
+            font-weight: 500;
+            box-shadow: 0 15px 35px rgba(168, 85, 247, 0.3);
+            animation: toastSlideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+            z-index: 1000;
+            max-width: 300px;
+            word-break: break-word;
+        }
+        @keyframes toastSlideIn {
+            from { opacity: 0; transform: translateX(30px) translateY(30px); }
+            to { opacity: 1; transform: translateX(0) translateY(0); }
         }
 
-        @keyframes shimmer {
-            100% { transform: translateX(100%); }
+        .loading-container {
+            min-height: 200px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            gap: 1rem;
+        }
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid rgba(255, 255, 255, 0.1);
+            border-radius: 50%;
+            border-top-color: var(--primary);
+            animation: spin 1s ease-in-out infinite;
+        }
+        .error-msg {
+            background: rgba(239, 68, 68, 0.15);
+            color: #fca5a5;
+            padding: 1rem;
+            border-radius: 12px;
+            font-size: 0.9rem;
+            border: 1px solid rgba(239, 68, 68, 0.2);
+            text-align: center;
         }
 
-        /* ============ 移动端响应式优化 ============ */
+        @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes modalSlideUp { from { opacity: 0; transform: translateY(30px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes shimmer { 100% { transform: translateX(100%); } }
+        @keyframes shake { 0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}75%{transform:translateX(8px)} }
+
+        /* 响应式 */
         @media (max-width: 768px) {
-            body {
-                padding: 1rem;
-            }
-
-            .container {
-                max-width: 100%;
-            }
-
-            .glass-card {
-                padding: 1.5rem;
-                border-radius: 20px;
-            }
-
-            header {
-                margin-bottom: 2rem;
-            }
-
-            h1 {
-                font-size: 1.25rem;
-                margin-bottom: 0.75rem;
-            }
-
-            .status-badge {
-                padding: 5px 10px;
-                font-size: 0.7rem;
-                gap: 4px;
-            }
-
-            .status-dot {
-                width: 5px;
-                height: 5px;
-            }
-
-            .usage-section {
-                margin-bottom: 1.5rem;
-            }
-
-            .usage-header {
-                flex-direction: column;
-                align-items: flex-start;
-                gap: 0.5rem;
-                margin-bottom: 0.75rem;
-            }
-
-            .label {
-                font-size: 0.85rem;
-            }
-
-            .percentage {
-                font-size: 1.1rem;
-            }
-
-            .progress-track {
-                height: 12px;
-            }
-
+            body { padding: 1rem; }
+            .container { max-width: 100%; }
+            .glass-card { padding: 1.5rem; }
+            h1 { font-size: 1.25rem; }
+            /* 统计卡片改为单列，每个卡片内今日/本月并排显示 */
             .stats-grid {
-                grid-template-columns: 1fr;
+                grid-template-columns: 1fr; /* 单列 */
                 gap: 0.75rem;
-                margin-top: 1.25rem;
             }
-
             .mini-card {
-                padding: 0.875rem 1rem;
-                gap: 1rem;
-            }
-
-            .mini-icon {
-                font-size: 1.5rem;
-            }
-
-            .mini-label {
-                font-size: 0.65rem;
-            }
-
-            .mini-value {
-                font-size: 1.1rem;
-            }
-
-            .total-text {
-                font-size: 0.75rem;
-                margin-top: 0.375rem;
-            }
-
-            .footer {
-                margin-top: 2rem;
-                font-size: 0.7rem;
-            }
-
-            .theme-bubble {
-                top: 1rem;
-                left: 1rem;
-                width: 44px;
-                height: 44px;
-            }
-
-            .theme-bubble svg {
-                width: 20px;
-                height: 20px;
-            }
-
-            .admin-bubble {
-                top: 1rem;
-                right: 1rem;
-                width: 44px;
-                height: 44px;
-            }
-
-            .admin-bubble svg {
-                width: 22px;
-                height: 22px;
-            }
-
-            .login-modal {
-                max-width: calc(100% - 2rem);
-                padding: 1.5rem;
-                border-radius: 18px;
-            }
-
-            .login-modal h2 {
-                font-size: 1.1rem;
-                margin-bottom: 1.25rem;
-            }
-
-            .login-input {
-                padding: 0.75rem 0.875rem;
-                font-size: 0.95rem;
-                margin-bottom: 0.875rem;
-                border-radius: 10px;
-            }
-
-            .login-btn {
+                display: flex;
+                flex-wrap: wrap;
                 padding: 0.75rem 1rem;
-                font-size: 0.95rem;
-                border-radius: 10px;
             }
-
-            .close-modal {
-                width: 28px;
-                height: 28px;
-                font-size: 1.1rem;
-                top: 0.75rem;
-                right: 0.75rem;
+            .mini-card .mini-row {
+                flex: 1 1 50%; /* 每个子项占一半宽度 */
+                margin-bottom: 0;
+                padding: 0 0.25rem;
+                box-sizing: border-box;
             }
-
-            .login-error {
-                padding: 0.65rem 0.875rem;
-                font-size: 0.8rem;
-                border-radius: 8px;
-                margin-bottom: 0.875rem;
+            .mini-card .mini-row .mini-icon {
+                font-size: 1.2rem;
+                width: 1.8rem;
             }
-
-            .toast-notification {
-                bottom: 1.5rem;
-                right: 1rem;
-                left: 1rem;
-                padding: 1rem 1.25rem;
-                font-size: 0.875rem;
-                border-radius: 10px;
-            }
-
-            .loading-container {
-                min-height: 150px;
-                gap: 0.75rem;
-            }
-
-            .spinner {
-                width: 36px;
-                height: 36px;
-                border-width: 2px;
-            }
-
-            .error-msg {
-                padding: 0.875rem;
-                font-size: 0.85rem;
-                border-radius: 10px;
-            }
-        }
-
-        /* 超小屏幕优化 (max-width: 480px) */
-        @media (max-width: 480px) {
-            body {
-                padding: 0.75rem;
-                min-height: 100vh;
-            }
-
-            .container {
-                max-width: 100%;
-            }
-
-            .glass-card {
-                padding: 1.25rem;
-                border-radius: 16px;
-                box-shadow: 
-                    0 15px 30px -8px rgba(0, 0, 0, 0.5),
-                    0 0 0 1px rgba(255, 255, 255, 0.05) inset;
-            }
-
-            header {
-                margin-bottom: 1.5rem;
-            }
-
-            h1 {
-                font-size: 1.15rem;
-                margin-bottom: 0.5rem;
-            }
-
-            .status-badge {
-                padding: 4px 8px;
-                font-size: 0.65rem;
-                gap: 3px;
-            }
-
-            .usage-section {
-                margin-bottom: 1.25rem;
-            }
-
-            .usage-header {
-                gap: 0.25rem;
-                margin-bottom: 0.625rem;
-            }
-
-            .label {
-                font-size: 0.8rem;
-            }
-
-            .percentage {
-                font-size: 1rem;
-            }
-
-            .progress-track {
-                height: 10px;
-                border-radius: 999px;
-            }
-
-            .stats-grid {
-                gap: 0.5rem;
-                margin-top: 1rem;
-            }
-
-            .mini-card {
-                padding: 0.75rem 0.875rem;
-                gap: 0.875rem;
-            }
-
-            .mini-card:hover {
-                transform: translateY(-2px);
-            }
-
-            .mini-icon {
-                font-size: 1.4rem;
-            }
-
-            .mini-label {
-                font-size: 0.6rem;
-                letter-spacing: 0.03em;
-            }
-
-            .mini-value {
-                font-size: 1rem;
-            }
-
-            .total-text {
-                font-size: 0.7rem;
-            }
-
-            .footer {
-                margin-top: 1.5rem;
+            .mini-card .mini-row .mini-label {
                 font-size: 0.65rem;
             }
-
-            .theme-bubble, .admin-bubble {
-                width: 40px;
-                height: 40px;
-                top: 0.75rem;
-            }
-
-            .theme-bubble {
-                left: 0.75rem;
-            }
-
-            .admin-bubble {
-                right: 0.75rem;
-            }
-
-            .theme-bubble svg, .admin-bubble svg {
-                width: 18px;
-                height: 18px;
-            }
-
-            .login-modal-overlay {
-                padding: 1rem;
-            }
-
-            .login-modal {
-                max-width: 100%;
-                width: 100%;
-                padding: 1.25rem;
-                border-radius: 16px;
-            }
-
-            .login-modal h2 {
-                font-size: 1rem;
-                margin-bottom: 1rem;
-            }
-
-            .login-input {
-                padding: 0.65rem 0.75rem;
-                font-size: 0.9rem;
-                margin-bottom: 0.75rem;
-                border-radius: 8px;
-            }
-
-            .login-input::placeholder {
+            .mini-card .mini-row .mini-value {
                 font-size: 0.9rem;
             }
-
-            .login-btn {
-                padding: 0.65rem 0.875rem;
-                font-size: 0.9rem;
-            }
-
-            .close-modal {
-                width: 26px;
-                height: 26px;
-                font-size: 1rem;
-                top: 0.5rem;
-                right: 0.5rem;
-            }
-
-            .login-error {
-                padding: 0.6rem 0.75rem;
-                font-size: 0.75rem;
-                margin-bottom: 0.75rem;
-            }
-
-            .toast-notification {
-                bottom: 1rem;
-                right: 0.75rem;
-                left: 0.75rem;
-                padding: 0.875rem 1rem;
-                font-size: 0.8rem;
-                max-width: 100%;
-            }
-
-            .loading-container {
-                min-height: 120px;
-                gap: 0.5rem;
-            }
-
-            .spinner {
-                width: 32px;
-                height: 32px;
-                border-width: 2px;
-            }
-
-            .error-msg {
-                padding: 0.75rem;
-                font-size: 0.8rem;
-            }
-        }
-
-        /* 竖屏超大手机优化 (min-height: 800px) */
-        @media (min-height: 800px) and (max-width: 768px) {
-            body {
-                justify-content: flex-start;
-                padding-top: 3rem;
-                padding-bottom: 2rem;
-            }
-
-            .container {
-                margin: 0 auto;
-            }
+            .theme-bubble, .admin-bubble { width: 44px; height: 44px; top: 1rem; }
+            .theme-bubble { left: 1rem; }
+            .admin-bubble { right: 1rem; }
+            .login-modal { max-width: calc(100% - 2rem); padding: 1.5rem; }
         }
     </style>
 </head>
@@ -2289,10 +2034,10 @@ async function UsagePanel主页(TOKEN) {
                     <div style="color: var(--text-muted); font-size: 0.9rem;">正在获取数据...</div>
                 </div>
             </div>
+        </div>
 
-            <div class="footer">
-                © 2022-<script>document.write(new Date().getFullYear())</script> 蜂巢·隱曜
-            </div>
+        <div class="footer">
+            © 2022-<script>document.write(new Date().getFullYear())</script> 蜂巢·隱曜
         </div>
     </div>
 
@@ -2323,41 +2068,32 @@ async function UsagePanel主页(TOKEN) {
         // 根据百分比计算颜色（绿 -> 黄 -> 红）
         function getGradientColor(percent) {
             percent = Math.max(0, Math.min(100, percent));
-            
             let r, g, b;
-            
             if (percent <= 50) {
-                // 绿色 (16, 185, 129) 到 黄色 (234, 179, 8)
                 const t = percent / 50;
                 r = Math.round(16 + (234 - 16) * t);
                 g = Math.round(185 + (179 - 185) * t);
                 b = Math.round(129 - 129 * t);
             } else {
-                // 黄色 (234, 179, 8) 到 红色 (239, 68, 68)
                 const t = (percent - 50) / 50;
                 r = Math.round(234 + (239 - 234) * t);
                 g = Math.round(179 - 179 * t);
                 b = Math.round(8 + (68 - 8) * t);
             }
-            
             return \`rgb(\${r}, \${g}, \${b})\`;
         }
 
-        // 获取对应百分比的色阴影
         function getGradientShadow(percent) {
             const color = getGradientColor(percent);
             const rgb = color.match(/\\d+/g);
             return \`rgba(\${rgb[0]}, \${rgb[1]}, \${rgb[2]}, 0.4)\`;
         }
 
-        // 应用颜色到进度条容器
         function applyGradientColor(container, percent) {
             const color = getGradientColor(percent);
             const shadow = getGradientShadow(percent);
             container.style.setProperty('--gradient-color', color);
             container.style.setProperty('--gradient-color-shadow', \`0 0 20px \${shadow}\`);
-            
-            // 设置进度条背景大小，让渐变正确显示
             const bar = container.querySelector('.progress-bar');
             if (bar && percent > 0) {
                 const bgSize = (100 / percent) * 100;
@@ -2371,61 +2107,98 @@ async function UsagePanel主页(TOKEN) {
                 const start = Date.now();
                 const response = await fetch('./usage.json?token=${TOKEN}&t=' + start);
                 const data = await response.json();
-                
-                // Artificially wait a bit for smooth UX if too fast
+
                 const elapsed = Date.now() - start;
                 if (elapsed < 600) await new Promise(r => setTimeout(r, 600 - elapsed));
-                
-                if (!data.success && typeof data.total === 'undefined') {
+
+                if (!data.success && typeof data.monthTotal === 'undefined') {
                     throw new Error('No Data Available');
                 }
 
-                const total = data.total || 0;
-                const max = data.max || 100000;
-                const percent = Math.min((total / max) * 100, 100).toFixed(1);
-                
+                const dayTotal = data.dayTotal || 0;
+                const monthTotal = data.monthTotal || 0;
+                const dayMax = data.max || 100000;
+                const monthMax = data.monthMax || 0;
+
+                const dayPercent = dayMax > 0 ? Math.min((dayTotal / dayMax) * 100, 100).toFixed(1) : 0;
+                const monthPercent = monthMax > 0 ? Math.min((monthTotal / monthMax) * 100, 100).toFixed(1) : 0;
+
+                // 修改点：将 dayMax 的显示从 "k" 改为 "万"
                 content.innerHTML = \`
                     <div class="usage-section">
-                        <div class="usage-header">
-                            <span class="label">总配额</span>
-                            <span class="percentage">\${percent}%</span>
+                        <div class="usage-item">
+                            <div class="usage-header">
+                                <span class="label">今日请求（每日上限合计 \${(dayMax/10000).toFixed(1)}万）</span>
+                                <span class="percentage">\${dayPercent}%</span>
+                            </div>
+                            <div class="progress-track">
+                                <div class="progress-bar" style="width: 0%"></div>
+                            </div>
+                            <div class="total-text">
+                                \${dayTotal.toLocaleString()} / \${dayMax.toLocaleString()} 今日已用
+                            </div>
                         </div>
-                        <div class="progress-track">
-                            <div class="progress-bar" style="width: 0%"></div>
-                        </div>
-                        <div class="total-text">
-                            \${total.toLocaleString()} / \${max.toLocaleString()} 请求次数
+                        <div class="usage-item">
+                            <div class="usage-header">
+                                <span class="label">本月请求（每月上限合计 \${(monthMax/10000).toFixed(0)} 万）</span>
+                                <span class="percentage">\${monthPercent}%</span>
+                            </div>
+                            <div class="progress-track">
+                                <div class="progress-bar" style="width: 0%"></div>
+                            </div>
+                            <div class="total-text">
+                                \${monthTotal.toLocaleString()} / \${monthMax.toLocaleString()} 本月累计
+                            </div>
                         </div>
                     </div>
-
                     <div class="stats-grid">
                         <div class="mini-card">
-                            <div class="mini-icon">🔶</div>
-                            <div class="mini-info">
-                                <div class="mini-label">Workers</div>
-                                <div class="mini-value">\${(data.workers || 0).toLocaleString()}</div>
+                            <div class="mini-row">
+                                <div class="mini-icon">🔶</div>
+                                <div class="mini-info">
+                                    <div class="mini-label">Workers (今日)</div>
+                                    <div class="mini-value">\${(data.dayWorkers || 0).toLocaleString()}</div>
+                                </div>
+                            </div>
+                            <div class="mini-row">
+                                <div class="mini-icon">🔶</div>
+                                <div class="mini-info">
+                                    <div class="mini-label">Workers (本月)</div>
+                                    <div class="mini-value">\${(data.monthWorkers || 0).toLocaleString()}</div>
+                                </div>
                             </div>
                         </div>
                         <div class="mini-card">
-                            <div class="mini-icon">⚡️</div>
-                            <div class="mini-info">
-                                <div class="mini-label">Pages</div>
-                                <div class="mini-value">\${(data.pages || 0).toLocaleString()}</div>
+                            <div class="mini-row">
+                                <div class="mini-icon">⚡️</div>
+                                <div class="mini-info">
+                                    <div class="mini-label">Pages (今日)</div>
+                                    <div class="mini-value">\${(data.dayPages || 0).toLocaleString()}</div>
+                                </div>
+                            </div>
+                            <div class="mini-row">
+                                <div class="mini-icon">⚡️</div>
+                                <div class="mini-info">
+                                    <div class="mini-label">Pages (本月)</div>
+                                    <div class="mini-value">\${(data.monthPages || 0).toLocaleString()}</div>
+                                </div>
                             </div>
                         </div>
                     </div>
                 \`;
 
-                // Animate progress bar and apply colors
                 requestAnimationFrame(() => {
-                    const usageSection = content.querySelector('.usage-section');
-                    const bar = content.querySelector('.progress-bar');
-                    if(usageSection) applyGradientColor(usageSection, percent);
-                    if(bar) bar.style.width = percent + '%';
+                    const usageItems = content.querySelectorAll('.usage-item');
+                    if (usageItems.length >= 2) {
+                        applyGradientColor(usageItems[0], dayPercent);
+                        applyGradientColor(usageItems[1], monthPercent);
+                    }
+                    const bars = content.querySelectorAll('.progress-bar');
+                    if (bars[0]) bars[0].style.width = dayPercent + '%';
+                    if (bars[1]) bars[1].style.width = monthPercent + '%';
                 });
 
             } catch (error) {
-                console.error(error);
                 content.innerHTML = \`
                     <div class="error-msg">
                         <div style="margin-bottom: 0.25rem; font-weight: 600;">数据获取失败</div>
@@ -2434,7 +2207,7 @@ async function UsagePanel主页(TOKEN) {
                 \`;
             }
         }
-        
+
         fetchUsage();
 
         // 管理员登录相关函数
@@ -2450,18 +2223,12 @@ async function UsagePanel主页(TOKEN) {
             document.getElementById('loginError').classList.remove('show');
         }
 
-        // 点击模态框外部关闭
         document.getElementById('loginModal').addEventListener('click', function(e) {
-            if (e.target === this) {
-                closeLoginModal();
-            }
+            if (e.target === this) closeLoginModal();
         });
 
-        // ESC键关闭模态框
         document.addEventListener('keydown', function(e) {
-            if (e.key === 'Escape') {
-                closeLoginModal();
-            }
+            if (e.key === 'Escape') closeLoginModal();
         });
 
         async function handleLogin() {
@@ -2491,7 +2258,6 @@ async function UsagePanel主页(TOKEN) {
                 const data = await response.json();
 
                 if (data.success) {
-                    // 登录成功，跳转到管理面板
                     window.location.href = './admin';
                 } else {
                     errorDiv.textContent = data.msg || '登录失败';
@@ -2516,17 +2282,13 @@ async function UsagePanel主页(TOKEN) {
                     msgElement.className = 'toast-notification';
                     msgElement.textContent = data.msg || '加载成功';
                     document.body.appendChild(msgElement);
-                    
-                    // 3秒后自动消失
                     setTimeout(() => {
                         msgElement.style.opacity = '0';
                         msgElement.style.transition = 'opacity 0.4s ease';
                         setTimeout(() => msgElement.remove(), 400);
                     }, 3000);
                 })
-                .catch(err => {
-                    console.error('无法获取消息:', err);
-                });
+                .catch(() => {});
         }, 1000);
     </script>
 </body>
